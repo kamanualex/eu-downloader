@@ -26,6 +26,10 @@ on:
         description: 'Files fetched at the same time (1 = one at a time). Try 3; compare the "answer time" in the progress lines'
         required: true
         default: '3'
+      parallel:
+        description: 'Years downloaded at the same time, each on its own machine (1 = one year at a time)'
+        required: true
+        default: '1'
 # Layout (John's choice, 2026-10-27): THIS repository is PUBLIC and holds only the downloader,
 # so GitHub Actions minutes are free. The raw data must not be public (Dukascopy data appears to
 # be licensed for personal use), so archives go to the PRIVATE research repository in DATA_REPO,
@@ -43,7 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
-      max-parallel: 1      # one year at a time: gentler on the provider
+      # Years at once (John, 2026-10-27). Raise in stages and watch the "answer time" in the
+      # progress lines: if it climbs well above ~15-20 s, the provider is slowing us down.
+      max-parallel: ${{ fromJSON(inputs.parallel) }}
       fail-fast: false
       matrix:
         year: ${{ fromJSON(inputs.years) }}
