@@ -1,0 +1,10 @@
+# Keep the same bytes on Windows and Linux (CI). Without this, Windows git can
+# rewrite line endings and patches stop applying (seen 2026-10-24).
+* text=auto eol=lf
+*.bat text eol=crlf
+*.bi5 binary
+*.zip binary
+*.gz binary
+*.docx binary
+*.xlsx binary
+*.png binary

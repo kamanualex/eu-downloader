@@ -1,0 +1,174 @@
+# Stage 5 of ROADMAP.md: download Dukascopy 1-minute BID+ASK candles, one job per year.
+# Start it from the GitHub website: Actions -> "download" -> Run workflow.
+#
+# Each year becomes a reproducible archive attached to the GitHub Release "raw-candles-v1"
+# of the PRIVATE repository DATA_REPO (see README.md):
+#   EURUSD_candles_<year>.tar.gz           all raw .bi5 files + manifest.jsonl
+#   EURUSD_candles_<year>.tar.gz.sha256    hash of that archive file
+#   EURUSD_candles_<year>.digest           CONTENT digest: hash of every file's URL, status and sha256,
+#                                          excluding fetch timestamps (feeds the P9.2 dataset_id)
+#
+# Immutability (P3.6): if a year already exists in the release, the new CONTENT digest must match.
+# (The archive bytes legitimately differ between runs because the manifest records fetch times.)
+# If the content differs, the job FAILS and nothing is overwritten (possible provider revision).
+#
+# Data end: DATA_END is the protocol's last data instant (P10: data through 2026Q3, with
+# 2025Q4-2026Q3 sealed as the holdout). Nothing after it is requested.
+name: download
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: 'JSON list of years, e.g. ["2011","2012"]. Full range: 2011..2026'
+        required: true
+        default: '["2011"]'
+      workers:
+        description: 'Files fetched at the same time (1 = one at a time). Try 3; compare the "answer time" in the progress lines'
+        required: true
+        default: '3'
+# Layout (John's choice, 2026-10-27): THIS repository is PUBLIC and holds only the downloader,
+# so GitHub Actions minutes are free. The raw data must not be public (Dukascopy data appears to
+# be licensed for personal use), so archives go to the PRIVATE research repository in DATA_REPO,
+# using the secret DATA_REPO_TOKEN (a fine-grained token with Contents: read and write on that
+# one repository only). The partial-download cache lives in this public repository, so it is
+# deleted as soon as a year is safely stored.
+permissions:
+  contents: read
+  actions: write           # to delete this year's partial-download cache once stored
+concurrency:
+  group: download          # never two download runs at once (the provider throttles)
+  cancel-in-progress: false
+jobs:
+  year:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      max-parallel: 1      # one year at a time: gentler on the provider
+      fail-fast: false
+      matrix:
+        year: ${{ fromJSON(inputs.years) }}
+    env:
+      YEAR: ${{ matrix.year }}
+      WORKERS: ${{ inputs.workers }}
+      TAG: raw-candles-v1
+      DATA_END: "2026-10-01"
+      DATA_REPO: kamanualex/eurusd-restart
+    steps:
+      - name: Check the data-repository token is set (fail before downloading anything)
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret DATA_REPO_TOKEN is not set. See README.md, step 3."; exit 1
+          fi
+          gh repo view "$DATA_REPO" --json visibility -q .visibility | tee vis.txt \
+            || { echo "::error::The token cannot read $DATA_REPO. Check the token's repository access."; exit 1; }
+          if [ "$(cat vis.txt)" != "PRIVATE" ]; then
+            echo "::error::$DATA_REPO is not private. Raw data must not be published. Nothing downloaded."; exit 1
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Self-tests must pass before any download
+        run: python phase1_dataset/fetch/test_dukascopy.py
+      # Resume (finding 2026-10-25): the first 2024 run hit GitHub's 5-hour job limit in pass 1
+      # (~55 s per file; most of it 30 s timeouts) and lost everything it had fetched. Now the
+      # partial snapshot is cached after every run, whatever the outcome, and restored by the next.
+      - name: Restore partial snapshot from earlier runs (if any)
+        uses: actions/cache/restore@v4
+        with:
+          path: snap/EURUSD_candles_${{ matrix.year }}
+          key: candles-${{ matrix.year }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: candles-${{ matrix.year }}-
+      - name: Download (pass 1, retry what is left, then re-check empties)
+        id: dl
+        timeout-minutes: 265
+        run: |
+          ROOT="snap/EURUSD_candles_${YEAR}"
+          END="$((YEAR+1))-01-01"
+          if [[ "$END" > "$DATA_END" ]]; then END="$DATA_END"; fi
+          echo "Year ${YEAR}: ${YEAR}-01-01 -> ${END} (exclusive)"
+          if [ -f "$ROOT/manifest.jsonl" ]; then
+            echo "Resuming: $(find "$ROOT" -name '*.bi5' | wc -l) file(s) already fetched by earlier runs"
+          fi
+          ARGS="--root $ROOT --kind candles --start ${YEAR}-01-01T00:00 --end ${END}T00:00 --weekdays-only --workers $WORKERS"
+          T0=$(date +%s); BUDGET=250          # minutes; leaves time to save the cache and upload
+          left() { echo $(( BUDGET - ($(date +%s) - T0) / 60 )); }
+          run() { local log=$1; shift
+                  set +e; python -u phase1_dataset/fetch/dukascopy.py $ARGS --budget-min "$(left)" "$@" | tee -a "$log"
+                  local rc=${PIPESTATUS[0]}; set -e; return $rc; }
+          rc=0
+          # Timeout 60 s (finding 2026-10-25, run 3: successful answers took median 19 s, p90 33 s,
+          # max 43 s, so a 30 s cutoff abandoned many requests that were about to succeed; a 10 s
+          # "quick sweep" was tried and reverted: 17% success).
+          run pass1.log --retries 6 --timeout 60 --allow-unavailable || rc=$?
+          # pass 2: patient retries of whatever pass 1 left
+          [ $rc -eq 0 ] && { run pass2.log --retries 6 --timeout 60 --allow-unavailable || rc=$?; }
+          # pass 3: re-check empty files; fails (rc 2) if anything is still unavailable
+          [ $rc -eq 0 ] && { run pass3.log --retries 6 --timeout 60 --recheck-empty || rc=$?; }
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "complete=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "::warning::Year ${YEAR} incomplete: time budget used. Progress is saved. Run the workflow again for this year to resume." ;;
+            2) echo "::warning::Year ${YEAR}: some files are still unavailable after all retries. Progress is saved. Run the workflow again for this year." ;;
+            *) echo "::error::Downloader failed with exit code $rc (not a transient problem). See the log above."; exit $rc ;;
+          esac
+      - name: Save partial snapshot for the next run (always)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: snap/EURUSD_candles_${{ matrix.year }}
+          key: candles-${{ matrix.year }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build reproducible archive
+        if: steps.dl.outputs.complete == 'true'
+        run: |
+          cd snap
+          tar --sort=name --mtime='2000-01-01 00:00Z' --owner=0 --group=0 --numeric-owner \
+              -cf - "EURUSD_candles_${YEAR}" | gzip -n > "EURUSD_candles_${YEAR}.tar.gz"
+          sha256sum "EURUSD_candles_${YEAR}.tar.gz" > "EURUSD_candles_${YEAR}.tar.gz.sha256"
+          python - <<PY > "EURUSD_candles_${YEAR}.digest"
+          import sys; sys.path.insert(0, "../phase1_dataset/fetch")
+          import dukascopy as dk
+          print(dk.Snapshot("EURUSD_candles_${YEAR}").manifest_digest())
+          PY
+          ls -la; cat "EURUSD_candles_${YEAR}.tar.gz.sha256" "EURUSD_candles_${YEAR}.digest"
+      - name: Attach to the private data repository's release (never overwrite different content)
+        if: steps.dl.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          GH_REPO: kamanualex/eurusd-restart
+        run: |
+          cd snap
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Raw EUR/USD 1-minute candles (Dukascopy), v1" \
+             --notes "Immutable raw snapshots, one archive per year. See phase1_dataset/fetch/dukascopy.py and research_protocol/P3."
+          DIG="EURUSD_candles_${YEAR}.digest"
+          if gh release download "$TAG" -p "$DIG" -D existing 2>/dev/null; then
+            if cmp -s "existing/$DIG" "$DIG"; then
+              echo "Year ${YEAR} already in the release with identical CONTENT: nothing to do."
+              exit 0
+            fi
+            echo "::error::Year ${YEAR} already exists in ${TAG} with DIFFERENT content -- possible provider revision. Nothing overwritten. Investigate (P3.6)."
+            echo "stored: $(cat existing/$DIG)  new: $(cat $DIG)"
+            exit 1
+          fi
+          gh release upload "$TAG" "EURUSD_candles_${YEAR}.tar.gz" "EURUSD_candles_${YEAR}.tar.gz.sha256" "$DIG"
+          echo "stored=true" >> "$GITHUB_OUTPUT"
+      - name: Delete this year's partial-download cache (data now stored privately)
+        if: steps.dl.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for k in $(gh cache list --key "candles-${YEAR}-" --limit 100 --json key -q '.[].key'); do
+            gh cache delete "$k" && echo "deleted cache $k"
+          done
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### ${YEAR}: $([ '${{ steps.dl.outputs.complete }}' = 'true' ] && echo COMPLETE || echo 'NOT complete yet: run again to resume')"
+            echo '```'; tail -n 3 pass1.log pass2.log pass3.log 2>/dev/null; cat snap/*.digest 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail visibly if the year is not complete
+        if: steps.dl.outputs.complete != 'true'
+        run: |
+          echo "::error::Year ${YEAR} is NOT complete and was NOT attached to the release. Progress is cached; run the workflow again with the same year to resume."
+          exit 1
